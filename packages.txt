@@ -2,4 +2,3 @@ gcc
 g++
 rustc
 cargo
-curl

@@ -6,7 +6,12 @@ import chromadb
 import numpy as np
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# try new import first then fall back to old one
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # make sure we can import from project root
 sys.path.append(str(Path(__file__).parent.parent))
@@ -31,7 +36,7 @@ def download_pdf():
         f.write(response.content)
 
     size_kb = pdf_path.stat().st_size / 1024
-    print(f"Downloaded PDF — {size_kb:.1f} KB saved to {pdf_path}")
+    print(f"Downloaded {size_kb:.1f} KB to {pdf_path}")
     return str(pdf_path)
 
 
@@ -44,7 +49,6 @@ def extract_text_from_pdf(pdf_path: str):
         page = doc[page_num]
         raw_text = page.get_text()
 
-        # clean up extra whitespace but keep paragraph breaks
         lines = [line.strip() for line in raw_text.splitlines()]
         cleaned = "\n".join(line for line in lines if line)
 
@@ -98,7 +102,7 @@ def chunk_pages(pages: list):
 def load_embedding_model():
     print(f"Loading embedding model: {settings.embedding_model}")
     model = SentenceTransformer(settings.embedding_model)
-    print("Embedding model loaded and ready")
+    print("Embedding model loaded")
     return model
 
 
@@ -106,7 +110,6 @@ def generate_embeddings(chunks: list, model: SentenceTransformer):
     print(f"Generating embeddings for {len(chunks)} chunks")
     texts = [c["text"] for c in chunks]
 
-    # process in small batches so we can see progress
     batch_size = 32
     all_embeddings = []
 
@@ -126,7 +129,11 @@ def generate_embeddings(chunks: list, model: SentenceTransformer):
     return all_embeddings
 
 
-def store_in_chromadb(chunks: list, embeddings: list, rebuild: bool = False):
+def store_in_chromadb(
+    chunks: list,
+    embeddings: list,
+    rebuild: bool = False,
+):
     print("Connecting to ChromaDB")
 
     persist_path = Path(settings.chroma_persist_dir)
@@ -134,23 +141,25 @@ def store_in_chromadb(chunks: list, embeddings: list, rebuild: bool = False):
 
     client = chromadb.PersistentClient(path=str(persist_path))
 
-    # if rebuild flag is set delete existing collection first
     if rebuild:
         try:
-            client.delete_collection(settings.chroma_collection_name)
+            client.delete_collection(
+                settings.chroma_collection_name
+            )
             print("Deleted existing collection for rebuild")
         except Exception:
             pass
 
-    # check if collection already has data
     try:
-        collection = client.get_collection(settings.chroma_collection_name)
+        collection = client.get_collection(
+            settings.chroma_collection_name
+        )
         existing_count = collection.count()
 
         if existing_count > 0 and not rebuild:
             print(
                 f"Collection already has {existing_count} chunks. "
-                "Use --rebuild flag to re-ingest."
+                "Skipping upsert."
             )
             return collection
     except Exception:
@@ -161,7 +170,6 @@ def store_in_chromadb(chunks: list, embeddings: list, rebuild: bool = False):
         metadata={"hnsw:space": "cosine"},
     )
 
-    # upsert in batches of 100
     batch_size = 100
     total = len(chunks)
 
@@ -191,7 +199,7 @@ def store_in_chromadb(chunks: list, embeddings: list, rebuild: bool = False):
         print(f"  Stored {done}/{total} chunks in ChromaDB")
 
     final_count = collection.count()
-    print(f"ChromaDB collection ready with {final_count} chunks")
+    print(f"ChromaDB ready with {final_count} chunks")
     return collection
 
 
@@ -200,22 +208,11 @@ def run_ingestion(rebuild: bool = False):
     print("Starting ingestion pipeline")
     print("=" * 50)
 
-    # step 1 download pdf
     pdf_path = download_pdf()
-
-    # step 2 extract text page by page
     pages = extract_text_from_pdf(pdf_path)
-
-    # step 3 chunk the text
     chunks = chunk_pages(pages)
-
-    # step 4 load local embedding model
     model = load_embedding_model()
-
-    # step 5 generate embeddings
     embeddings = generate_embeddings(chunks, model)
-
-    # step 6 store in chromadb
     store_in_chromadb(chunks, embeddings, rebuild=rebuild)
 
     print("=" * 50)
