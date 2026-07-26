@@ -1,41 +1,191 @@
 import sys
-import requests
+import os
+import time
 import streamlit as st
 from pathlib import Path
 
+# add project root to python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-API_BASE = "http://localhost:8000"
 
+def load_secrets():
+    """
+    pull keys from st.secrets when running on streamlit cloud
+    and set them as env vars so settings.py can read them
+    """
+    try:
+        keys = [
+            "GROQ_API_KEY",
+            "EMBEDDING_MODEL",
+            "LLM_MODEL",
+            "CHROMA_PERSIST_DIR",
+            "CHROMA_COLLECTION_NAME",
+            "TOP_K_RESULTS",
+            "RELEVANCE_THRESHOLD",
+            "CHUNK_SIZE",
+            "CHUNK_OVERLAP",
+            "PDF_URL",
+            "PDF_LOCAL_PATH",
+        ]
+        for key in keys:
+            if key in st.secrets:
+                os.environ[key] = str(st.secrets[key])
+    except Exception:
+        pass
+
+
+# must run before any other imports
+load_secrets()
+
+from config.settings import settings
+from graph.rag_graph import run_query
+from ingestion.ingest import run_ingestion
+
+
+# ── page config ───────────────────────────────────────────────────
 st.set_page_config(
     page_title="Agentic AI Chatbot",
     page_icon="🤖",
     layout="wide",
 )
 
-st.title("🤖 Agentic AI RAG Chatbot")
-st.caption(
-    "Ask anything about Agentic AI. "
-    "Answers come strictly from the eBook with page citations."
-)
 
-# sidebar shows health info
-with st.sidebar:
-    st.header("System Status")
+# ── helper functions ──────────────────────────────────────────────
+def check_knowledge_base():
+    """
+    check if chromadb collection exists and has data
+    returns tuple of (is_populated, chunk_count)
+    """
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(
+            path=settings.chroma_persist_dir
+        )
+        col = client.get_collection(
+            settings.chroma_collection_name
+        )
+        count = col.count()
+        return count > 0, count
+    except Exception:
+        return False, 0
+
+
+def load_ebook():
+    """
+    run the full ingestion pipeline with streamlit
+    progress updates so user knows what is happening
+    """
+    progress = st.progress(0)
+    status = st.empty()
 
     try:
-        health = requests.get(f"{API_BASE}/health", timeout=5).json()
-        if health.get("index_populated"):
-            st.success("✅ Knowledge base ready")
-            st.write(f"Chunks stored: {health.get('total_chunks', 0)}")
-        else:
-            st.error("❌ Knowledge base empty — run ingestion first")
-    except Exception:
-        st.error("❌ API not reachable — start FastAPI first")
+        status.text("📥 Downloading PDF from konverge.ai...")
+        progress.progress(10)
+        time.sleep(0.5)
+
+        status.text("📄 Extracting text from PDF...")
+        progress.progress(25)
+
+        status.text("✂️ Chunking text into pieces...")
+        progress.progress(40)
+
+        status.text("🧠 Loading embedding model locally...")
+        progress.progress(55)
+
+        status.text("🔢 Generating embeddings for all chunks...")
+        progress.progress(70)
+
+        status.text("💾 Storing in ChromaDB vector store...")
+        progress.progress(85)
+
+        run_ingestion(rebuild=False)
+
+        progress.progress(100)
+        status.text("✅ eBook loaded successfully!")
+        time.sleep(1)
+        progress.empty()
+        status.empty()
+        return True
+
+    except Exception as e:
+        progress.empty()
+        status.empty()
+        st.error(f"Failed to load eBook: {str(e)}")
+        return False
+
+
+def ask_question(question: str):
+    """
+    send question directly to langgraph pipeline
+    no fastapi needed here
+    returns result dict or None on error
+    """
+    try:
+        start = time.time()
+        result = run_query(question)
+        elapsed = int((time.time() - start) * 1000)
+        result["processing_time_ms"] = elapsed
+        return result, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ── page header ───────────────────────────────────────────────────
+st.title("🤖 Agentic AI RAG Chatbot")
+st.caption(
+    "Ask anything about the Agentic AI eBook. "
+    "Every answer comes strictly from the book with page citations."
+)
+
+
+# ── sidebar ───────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("📊 System Status")
+
+    is_populated, chunk_count = check_knowledge_base()
+
+    if not is_populated:
+        st.warning("⚠️ Knowledge base is empty")
+        st.write(
+            "The eBook has not been loaded yet. "
+            "Click the button below to get started."
+        )
+
+        if st.button(
+            "📥 Load Agentic AI eBook",
+            use_container_width=True,
+            type="primary",
+        ):
+            with st.spinner("Loading eBook. This takes 3 to 5 minutes..."):
+                success = load_ebook()
+                if success:
+                    st.success("✅ eBook loaded!")
+                    st.rerun()
+                else:
+                    st.error("❌ Load failed. Check logs.")
+
+    else:
+        st.success("✅ Knowledge base ready")
+        st.metric("Chunks stored", chunk_count)
+
+        if st.button(
+            "🔄 Reload eBook",
+            use_container_width=True,
+        ):
+            with st.spinner("Reloading..."):
+                run_ingestion(rebuild=True)
+                st.success("Done!")
+                st.rerun()
 
     st.divider()
-    st.header("Sample Questions")
-    sample_questions = [
+
+    if st.button("🔄 Refresh Status", use_container_width=True):
+        st.rerun()
+
+    st.divider()
+    st.header("💡 Sample Questions")
+
+    samples = [
         "What is Agentic AI?",
         "How does Agentic AI differ from traditional AI?",
         "What are the core components of an agentic system?",
@@ -44,110 +194,132 @@ with st.sidebar:
         "What does the eBook say about the future of Agentic AI?",
     ]
 
-    for q in sample_questions:
+    for q in samples:
         if st.button(q, use_container_width=True):
-            st.session_state["prefill_question"] = q
+            st.session_state["prefill"] = q
 
-# init chat history
+    st.divider()
+    st.caption(
+        "Built with LangGraph + Groq + ChromaDB\n\n"
+        "Embeddings run locally — only Groq API is external"
+    )
+
+
+# ── chat history init ─────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# show previous messages
+
+# ── show past messages ────────────────────────────────────────────
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-        if msg["role"] == "assistant" and "chunks" in msg:
-            confidence = msg.get("confidence", 0)
-            color = (
-                "green" if confidence >= 0.75
-                else "orange" if confidence >= 0.5
-                else "red"
-            )
+        if msg["role"] == "assistant" and "meta" in msg:
+            meta = msg["meta"]
+            confidence = meta.get("confidence", 0)
+            time_ms = meta.get("processing_time_ms", 0)
+            chunks = meta.get("chunks", [])
+
+            if confidence >= 0.75:
+                color = "green"
+            elif confidence >= 0.5:
+                color = "orange"
+            else:
+                color = "red"
+
             st.markdown(
                 f"**Confidence:** :{color}[{confidence:.0%}]"
+                f" | ⏱ {time_ms}ms"
             )
 
-            with st.expander("📄 Source Chunks from eBook"):
-                for i, chunk in enumerate(msg["chunks"], 1):
-                    st.markdown(
-                        f"**Chunk {i} — Page {chunk['page']} "
-                        f"(Score: {chunk['score']:.3f})**"
-                    )
-                    st.text(chunk["text"][:400] + "...")
-                    st.divider()
-
-# handle prefilled question from sidebar buttons
-prefill = st.session_state.pop("prefill_question", None)
-
-user_input = st.chat_input(
-    "Ask a question about Agentic AI...",
-)
-
-# use prefill if button was clicked otherwise use typed input
-question = prefill or user_input
-
-if question:
-    # show user message
-    st.session_state.messages.append(
-        {"role": "user", "content": question}
-    )
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    # call the api and show response
-    with st.chat_message("assistant"):
-        with st.spinner("Searching the eBook and generating answer..."):
-            try:
-                response = requests.post(
-                    f"{API_BASE}/chat",
-                    json={"question": question},
-                    timeout=60,
-                )
-                data = response.json()
-
-                answer = data.get("answer", "No answer returned.")
-                chunks = data.get("context_chunks", [])
-                confidence = data.get("confidence", 0.0)
-                time_ms = data.get("processing_time_ms", 0)
-
-                st.markdown(answer)
-
-                color = (
-                    "green" if confidence >= 0.75
-                    else "orange" if confidence >= 0.5
-                    else "red"
-                )
-                st.markdown(
-                    f"**Confidence:** :{color}[{confidence:.0%}] "
-                    f"| ⏱ {time_ms}ms"
-                )
-
-                with st.expander("📄 Source Chunks from eBook"):
+            if chunks:
+                with st.expander("📄 View Source Chunks"):
                     for i, chunk in enumerate(chunks, 1):
                         st.markdown(
-                            f"**Chunk {i} — Page {chunk['page']} "
-                            f"(Score: {chunk['score']:.3f})**"
+                            f"**Chunk {i} — Page {chunk['page']}"
+                            f" | Score {chunk['score']:.3f}**"
                         )
                         st.text(chunk["text"][:400] + "...")
                         st.divider()
 
-                # save to history
+
+# ── chat input ────────────────────────────────────────────────────
+prefill = st.session_state.pop("prefill", None)
+user_input = st.chat_input(
+    "Ask a question about Agentic AI...",
+    disabled=not is_populated,
+)
+question = prefill or user_input
+
+
+if question:
+    # block if knowledge base is empty
+    if not is_populated:
+        st.warning(
+            "Please load the eBook first. "
+            "Click 📥 Load Agentic AI eBook in the sidebar."
+        )
+        st.stop()
+
+    # show user message
+    st.session_state.messages.append(
+        {"role": "user", "content": question}
+    )
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    # get answer from pipeline directly
+    with st.chat_message("assistant"):
+        with st.spinner("Searching eBook and generating answer..."):
+            result, error = ask_question(question)
+
+            if error:
+                msg = f"Something went wrong: {error}"
+                st.error(msg)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": msg}
+                )
+
+            else:
+                answer = result.get("answer", "No answer found.")
+                chunks = result.get("context_chunks", [])
+                confidence = result.get("confidence", 0.0)
+                time_ms = result.get("processing_time_ms", 0)
+
+                st.markdown(answer)
+
+                if confidence >= 0.75:
+                    color = "green"
+                elif confidence >= 0.5:
+                    color = "orange"
+                else:
+                    color = "red"
+
+                st.markdown(
+                    f"**Confidence:** :{color}[{confidence:.0%}]"
+                    f" | ⏱ {time_ms}ms"
+                )
+
+                if chunks:
+                    with st.expander("📄 View Source Chunks"):
+                        for i, chunk in enumerate(chunks, 1):
+                            st.markdown(
+                                f"**Chunk {i} — Page {chunk['page']}"
+                                f" | Score {chunk['score']:.3f}**"
+                            )
+                            st.text(chunk["text"][:400] + "...")
+                            st.divider()
+
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "content": answer,
-                        "chunks": chunks,
-                        "confidence": confidence,
+                        "meta": {
+                            "confidence": confidence,
+                            "processing_time_ms": time_ms,
+                            "chunks": chunks,
+                        },
                     }
-                )
-
-            except Exception as e:
-                err_msg = (
-                    f"Could not reach the API. "
-                    f"Make sure FastAPI is running. Error: {e}"
-                )
-                st.error(err_msg)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": err_msg}
                 )
