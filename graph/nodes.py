@@ -4,6 +4,7 @@ from pathlib import Path
 from groq import Groq
 import chromadb
 import streamlit as st
+from chromadb.utils import embedding_functions
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -16,29 +17,28 @@ from graph.prompts import (
 )
 
 
-# ── cached loaders so models load only once ───────────────────────
 @st.cache_resource(show_spinner=False)
-def get_embedding_model():
+def get_embedding_function():
     """
-    loads once and stays in memory
-    st.cache_resource persists across reruns
-    so we never reload the model twice
+    chromadb default embedding uses onnxruntime
+    no torch no torchvision required
+    loads once and stays cached
     """
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(settings.embedding_model)
-    return model
+    return embedding_functions.DefaultEmbeddingFunction()
 
 
 @st.cache_resource(show_spinner=False)
 def get_chroma_collection():
     """
-    opens chromadb connection once and reuses it
+    open chromadb connection once and reuse it
     """
+    ef = get_embedding_function()
     client = chromadb.PersistentClient(
         path=settings.chroma_persist_dir
     )
     collection = client.get_collection(
-        settings.chroma_collection_name
+        name=settings.chroma_collection_name,
+        embedding_function=ef,
     )
     return collection
 
@@ -46,24 +46,17 @@ def get_chroma_collection():
 @st.cache_resource(show_spinner=False)
 def get_groq_client():
     """
-    creates groq client once and reuses it
+    create groq client once and reuse across queries
     """
     return Groq(api_key=settings.groq_api_key)
 
 
-# ── graph nodes ───────────────────────────────────────────────────
 def retrieve_node(state: RAGState) -> RAGState:
     """
-    embed the question and search chromadb
-    for the most relevant chunks
+    embed question using chromadb built in function
+    then search for top k most relevant chunks
     """
     question = state["question"]
-
-    model = get_embedding_model()
-    query_vector = model.encode(
-        [question],
-        normalize_embeddings=True,
-    ).tolist()[0]
 
     try:
         collection = get_chroma_collection()
@@ -74,8 +67,9 @@ def retrieve_node(state: RAGState) -> RAGState:
             "best_score": 0.0,
         }
 
+    # chromadb handles embedding the query internally
     results = collection.query(
-        query_embeddings=[query_vector],
+        query_texts=[question],
         n_results=settings.top_k_results,
         include=["documents", "metadatas", "distances"],
     )
@@ -83,7 +77,11 @@ def retrieve_node(state: RAGState) -> RAGState:
     chunks = []
     best_score = 0.0
 
-    if results and results["documents"] and results["documents"][0]:
+    if (
+        results
+        and results["documents"]
+        and results["documents"][0]
+    ):
         docs = results["documents"][0]
         metas = results["metadatas"][0]
         distances = results["distances"][0]
@@ -112,8 +110,8 @@ def retrieve_node(state: RAGState) -> RAGState:
 
 def grade_relevance_node(state: RAGState) -> RAGState:
     """
-    check if best score clears the threshold
-    set route field for the conditional edge
+    check best score against threshold
+    set route for conditional edge
     """
     best_score = state.get("best_score", 0.0)
 
@@ -128,8 +126,8 @@ def grade_relevance_node(state: RAGState) -> RAGState:
 
 def generate_node(state: RAGState) -> RAGState:
     """
-    build grounded prompt from chunks and call groq
-    then run a quick self check for hallucination
+    build grounded prompt and call groq llm
+    then self check the answer for hallucinations
     """
     question = state["question"]
     chunks = state["retrieved_chunks"]
@@ -153,8 +151,9 @@ def generate_node(state: RAGState) -> RAGState:
             {
                 "role": "system",
                 "content": (
-                    "You are a precise assistant that only answers "
-                    "from provided context. Never guess or hallucinate."
+                    "You are a precise assistant. "
+                    "Only answer from the provided context. "
+                    "Never guess or make up information."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -163,7 +162,9 @@ def generate_node(state: RAGState) -> RAGState:
         max_tokens=800,
     )
 
-    answer_text = answer_resp.choices[0].message.content.strip()
+    answer_text = (
+        answer_resp.choices[0].message.content.strip()
+    )
 
     check_prompt = SELF_CHECK_PROMPT.format(
         question=question,
@@ -186,7 +187,9 @@ def generate_node(state: RAGState) -> RAGState:
     self_check_passed = check_text.startswith("yes")
 
     avg_score = float(
-        np.mean([c["score"] for c in chunks]) if chunks else 0.0
+        np.mean([c["score"] for c in chunks])
+        if chunks
+        else 0.0
     )
     multiplier = 1.0 if self_check_passed else 0.6
     confidence = round(avg_score * multiplier, 2)
@@ -201,7 +204,7 @@ def generate_node(state: RAGState) -> RAGState:
 
 def no_answer_node(state: RAGState) -> RAGState:
     """
-    fallback when nothing relevant was retrieved
+    fallback when retrieval finds nothing relevant
     """
     return {
         **state,
@@ -213,6 +216,6 @@ def no_answer_node(state: RAGState) -> RAGState:
 
 def route_after_grading(state: RAGState) -> str:
     """
-    used as conditional edge function in langgraph
+    conditional edge function for langgraph
     """
     return state.get("route", "no_answer")

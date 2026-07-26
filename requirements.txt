@@ -1,4 +1,3 @@
-sentence-transformers
 groq
 chromadb
 pymupdf
@@ -13,6 +12,6 @@ pydantic
 pydantic-settings
 streamlit
 python-dotenv
-tiktoken
 numpy
 httpx
+onnxruntime

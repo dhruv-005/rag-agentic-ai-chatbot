@@ -5,6 +5,7 @@ import fitz
 import chromadb
 import numpy as np
 from pathlib import Path
+from chromadb.utils import embedding_functions
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,11 +17,21 @@ sys.path.append(str(Path(__file__).parent.parent))
 from config.settings import settings
 
 
+def get_embedding_function():
+    """
+    use chromadb built in embedding function
+    this uses onnxruntime under the hood
+    no torch no torchvision needed at all
+    model is all-MiniLM-L6-v2 which is small and fast
+    """
+    return embedding_functions.DefaultEmbeddingFunction()
+
+
 def download_pdf():
     pdf_path = Path(settings.pdf_local_path)
 
     if pdf_path.exists():
-        print(f"PDF already exists — skipping download")
+        print("PDF already exists — skipping download")
         return str(pdf_path)
 
     print(f"Downloading PDF from {settings.pdf_url}")
@@ -95,47 +106,8 @@ def chunk_pages(pages: list):
     return all_chunks
 
 
-def load_embedding_model():
-    """
-    load model with minimal memory footprint
-    """
-    from sentence_transformers import SentenceTransformer
-    print(f"Loading {settings.embedding_model}")
-    model = SentenceTransformer(
-        settings.embedding_model,
-        device="cpu",
-    )
-    print("Model loaded")
-    return model
-
-
-def generate_embeddings(chunks: list, model):
-    print(f"Embedding {len(chunks)} chunks")
-    texts = [c["text"] for c in chunks]
-
-    # smaller batch size uses less RAM
-    batch_size = 16
-    all_embeddings = []
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        batch_emb = model.encode(
-            batch,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=16,
-        )
-        all_embeddings.extend(batch_emb.tolist())
-        done = min(i + batch_size, len(texts))
-        print(f"  {done}/{len(texts)} embedded")
-
-    print("Embeddings done")
-    return all_embeddings
-
-
 def store_in_chromadb(
     chunks: list,
-    embeddings: list,
     rebuild: bool = False,
 ):
     print("Storing in ChromaDB")
@@ -144,6 +116,10 @@ def store_in_chromadb(
     persist_path.mkdir(parents=True, exist_ok=True)
 
     client = chromadb.PersistentClient(path=str(persist_path))
+
+    # use chromadb default embedding function
+    # no torch needed uses onnxruntime instead
+    ef = get_embedding_function()
 
     if rebuild:
         try:
@@ -156,7 +132,8 @@ def store_in_chromadb(
 
     try:
         collection = client.get_collection(
-            settings.chroma_collection_name
+            name=settings.chroma_collection_name,
+            embedding_function=ef,
         )
         if collection.count() > 0 and not rebuild:
             print(f"Already has {collection.count()} chunks")
@@ -166,19 +143,19 @@ def store_in_chromadb(
 
     collection = client.get_or_create_collection(
         name=settings.chroma_collection_name,
+        embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
 
+    # upsert in small batches
     batch_size = 50
     total = len(chunks)
 
     for i in range(0, total, batch_size):
         bc = chunks[i : i + batch_size]
-        be = embeddings[i : i + batch_size]
 
         collection.upsert(
             ids=[c["chunk_id"] for c in bc],
-            embeddings=be,
             documents=[c["text"] for c in bc],
             metadatas=[
                 {
@@ -202,12 +179,10 @@ def run_ingestion(rebuild: bool = False):
     pdf_path = download_pdf()
     pages = extract_text_from_pdf(pdf_path)
     chunks = chunk_pages(pages)
-    model = load_embedding_model()
-    embeddings = generate_embeddings(chunks, model)
-    store_in_chromadb(chunks, embeddings, rebuild=rebuild)
 
-    # free model from memory after ingestion
-    del model
+    # no separate embedding step needed
+    # chromadb handles embeddings internally
+    store_in_chromadb(chunks, rebuild=rebuild)
 
     print("Ingestion complete")
 
