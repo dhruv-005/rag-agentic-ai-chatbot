@@ -1,0 +1,60 @@
+[
+  {
+    "id": 1,
+    "question": "What is Agentic AI?",
+    "expected_keywords": [
+      "autonomous",
+      "agent",
+      "decision"
+    ]
+  },
+  {
+    "id": 2,
+    "question": "How does Agentic AI differ from traditional AI or automation?",
+    "expected_keywords": [
+      "traditional",
+      "automation",
+      "difference"
+    ]
+  },
+  {
+    "id": 3,
+    "question": "What are the core components of an agentic system?",
+    "expected_keywords": [
+      "component",
+      "memory",
+      "tools",
+      "planning"
+    ]
+  },
+  {
+    "id": 4,
+    "question": "What industries or use cases does the eBook mention for Agentic AI?",
+    "expected_keywords": [
+      "industry",
+      "healthcare",
+      "finance",
+      "use case"
+    ]
+  },
+  {
+    "id": 5,
+    "question": "What are the risks or challenges of Agentic AI?",
+    "expected_keywords": [
+      "risk",
+      "challenge",
+      "safety",
+      "concern"
+    ]
+  },
+  {
+    "id": 6,
+    "question": "What does the eBook say about the future of Agentic AI?",
+    "expected_keywords": [
+      "future",
+      "trend",
+      "prediction",
+      "roadmap"
+    ]
+  }
+]

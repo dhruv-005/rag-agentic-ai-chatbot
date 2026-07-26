@@ -1,0 +1,39 @@
+# never push real api keys
+.env
+
+# python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# virtual environment
+venv/
+env/
+.venv/
+
+# chromadb local data
+data/chroma_db/
+
+# downloaded pdf
+data/*.pdf
+
+# pytest cache
+.pytest_cache/
+
+# ide folders
+.vscode/
+.idea/
+*.swp
+
+# os files
+.DS_Store
+Thumbs.db
+
+# build files
+*.egg-info/
+dist/
+build/
+
+# logs
+*.log
