@@ -7,7 +7,6 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
-# ── must run before anything else ────────────────────────────────
 def load_secrets():
     try:
         all_secrets = dict(st.secrets)
@@ -19,7 +18,6 @@ def load_secrets():
 
 load_secrets()
 
-# ── now safe to import settings ───────────────────────────────────
 from config.settings import settings
 from graph.rag_graph import run_query
 from ingestion.ingest import run_ingestion
@@ -27,21 +25,14 @@ from ingestion.ingest import run_ingestion
 
 st.set_page_config(
     page_title="Agentic AI Chatbot",
-    page_icon="🤖",
     layout="wide",
 )
 
 
 def get_groq_key():
-    """
-    try every possible way to get the groq key
-    """
-    # way 1 - from os environ
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if key and key.startswith("gsk_"):
         return key
-
-    # way 2 - directly from st.secrets
     try:
         key = str(st.secrets["GROQ_API_KEY"]).strip()
         if key and key.startswith("gsk_"):
@@ -49,16 +40,6 @@ def get_groq_key():
             return key
     except Exception:
         pass
-
-    # way 3 - from st.secrets as dict
-    try:
-        key = str(st.secrets.get("GROQ_API_KEY", "")).strip()
-        if key and key.startswith("gsk_"):
-            os.environ["GROQ_API_KEY"] = key
-            return key
-    except Exception:
-        pass
-
     return ""
 
 
@@ -67,8 +48,8 @@ def check_groq_key():
     if not key:
         return False, "GROQ_API_KEY is empty"
     if not key.startswith("gsk_"):
-        return False, f"Key format wrong starts with {key[:6]}"
-    return True, f"Key found starts with {key[:8]}..."
+        return False, "Key format is wrong"
+    return True, f"Key found: {key[:10]}..."
 
 
 def check_knowledge_base():
@@ -87,6 +68,32 @@ def check_knowledge_base():
         return count > 0, count
     except Exception:
         return False, 0
+
+
+def auto_ingest_if_empty():
+    """
+    check if database is empty and auto load the ebook
+    this runs silently on every app startup
+    so any device that opens the app gets data automatically
+    """
+    is_populated, count = check_knowledge_base()
+
+    if not is_populated:
+        with st.spinner(
+            "Setting up knowledge base. "
+            "This takes a few minutes on first load..."
+        ):
+            try:
+                run_ingestion(rebuild=False)
+                st.success(
+                    "Knowledge base ready. You can now ask questions."
+                )
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(
+                    f"Failed to load knowledge base: {str(e)}"
+                )
 
 
 def test_groq_connection():
@@ -110,23 +117,23 @@ def test_groq_connection():
         return False, str(e)
 
 
-def load_ebook():
+def load_ebook_manual():
     progress = st.progress(0)
     status = st.empty()
     try:
-        status.text("📥 Downloading PDF...")
+        status.text("Downloading PDF...")
         progress.progress(15)
-        status.text("📄 Extracting text...")
+        status.text("Extracting text...")
         progress.progress(35)
-        status.text("✂️ Chunking pages...")
+        status.text("Chunking pages...")
         progress.progress(55)
-        status.text("🔢 Generating embeddings...")
+        status.text("Generating embeddings...")
         progress.progress(75)
-        status.text("💾 Saving to ChromaDB...")
+        status.text("Saving to ChromaDB...")
         progress.progress(90)
-        run_ingestion(rebuild=False)
+        run_ingestion(rebuild=True)
         progress.progress(100)
-        status.text("✅ Done!")
+        status.text("Done!")
         time.sleep(1)
         progress.empty()
         status.empty()
@@ -139,11 +146,9 @@ def load_ebook():
 
 
 def ask_question(question: str):
-    # make sure key is set before calling pipeline
     key = get_groq_key()
     if key:
         os.environ["GROQ_API_KEY"] = key
-
     try:
         start = time.time()
         result = run_query(question)
@@ -154,76 +159,81 @@ def ask_question(question: str):
         return None, str(e)
 
 
-# ── page header ───────────────────────────────────────────────────
-st.title("🤖 Agentic AI RAG Chatbot")
+# ── auto ingest on every startup ──────────────────────────────────
+# this ensures any device that opens the app
+# gets a working knowledge base automatically
+auto_ingest_if_empty()
+
+# ── page ──────────────────────────────────────────────────────────
+st.title("Agentic AI RAG Chatbot")
 st.caption(
-    "Answers come strictly from the Agentic AI eBook "
-    "with page citations and confidence scores."
+    "Ask anything about the Agentic AI eBook. "
+    "Answers include page citations and confidence scores."
 )
 
 # ── sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("📊 System Status")
+    st.header("System Status")
 
     key_ok, key_msg = check_groq_key()
     is_populated, chunk_count = check_knowledge_base()
 
     if key_ok:
-        st.success(f"✅ Groq key: {key_msg}")
+        st.success(f"Groq key ready: {key_msg}")
     else:
-        st.error(f"❌ Groq key issue: {key_msg}")
+        st.error(f"Groq key issue: {key_msg}")
         st.warning(
             "Go to Streamlit Cloud\n"
-            "→ Settings → Secrets\n"
+            "Settings then Secrets\n"
             "Add your GROQ_API_KEY"
         )
 
     if not is_populated:
-        st.warning("⚠️ Knowledge base is empty")
+        st.warning("Knowledge base is empty")
         if st.button(
-            "📥 Load Agentic AI eBook",
+            "Load Agentic AI eBook",
             use_container_width=True,
             type="primary",
             disabled=not key_ok,
         ):
             with st.spinner("Loading eBook..."):
-                success = load_ebook()
+                success = load_ebook_manual()
                 if success:
-                    st.success("✅ eBook loaded!")
+                    st.success("eBook loaded successfully")
                     st.rerun()
     else:
-        st.success("✅ Knowledge base ready")
+        st.success("Knowledge base ready")
         st.metric("Chunks stored", chunk_count)
 
         if st.button(
-            "🔄 Reload eBook",
+            "Reload eBook",
             use_container_width=True,
         ):
             with st.spinner("Reloading..."):
-                run_ingestion(rebuild=True)
+                load_ebook_manual()
                 st.rerun()
 
     st.divider()
 
     if st.button(
-        "🔌 Test Groq Connection",
+        "Test Groq Connection",
         use_container_width=True,
     ):
-        with st.spinner("Testing Groq..."):
+        with st.spinner("Testing..."):
             ok, msg = test_groq_connection()
             if ok:
-                st.success(f"✅ Groq works: {msg}")
+                st.success(f"Groq connected: {msg}")
             else:
-                st.error(f"❌ Groq error: {msg}")
+                st.error(f"Groq failed: {msg}")
 
     if st.button(
-        "🔄 Refresh Status",
+        "Refresh Status",
         use_container_width=True,
     ):
         st.rerun()
 
     st.divider()
-    st.header("💡 Sample Questions")
+    st.header("Sample Questions")
 
     samples = [
         "What is Agentic AI?",
@@ -239,7 +249,9 @@ with st.sidebar:
             st.session_state["prefill"] = q
 
     st.divider()
-    st.caption("Built with LangGraph + Groq + ChromaDB")
+    st.caption(
+        "Built with LangGraph, Groq, and ChromaDB"
+    )
 
 
 # ── chat history ──────────────────────────────────────────────────
@@ -264,16 +276,17 @@ for msg in st.session_state.messages:
                 color = "red"
 
             st.markdown(
-                f"**Confidence:** :{color}[{confidence:.0%}]"
-                f" | ⏱ {time_ms}ms"
+                f"Confidence: :{color}[{confidence:.0%}]"
+                f" | Time: {time_ms}ms"
             )
 
             if chunks:
-                with st.expander("📄 View Source Chunks"):
+                with st.expander("View Source Chunks"):
                     for i, chunk in enumerate(chunks, 1):
                         st.markdown(
-                            f"**Chunk {i} — Page {chunk['page']}"
-                            f" | Score {chunk['score']:.3f}**"
+                            f"Chunk {i} "
+                            f"Page {chunk['page']} "
+                            f"Score {chunk['score']:.3f}"
                         )
                         st.text(chunk["text"][:400] + "...")
                         st.divider()
@@ -299,8 +312,7 @@ if question:
 
     if not is_populated:
         st.warning(
-            "Load the eBook first. "
-            "Click 📥 Load Agentic AI eBook in sidebar."
+            "Knowledge base is loading. Please wait."
         )
         st.stop()
 
@@ -312,7 +324,7 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching and generating answer..."):
+        with st.spinner("Generating answer..."):
             result, error = ask_question(question)
 
             if error:
@@ -327,7 +339,9 @@ if question:
                 answer = result.get("answer", "")
                 chunks = result.get("context_chunks", [])
                 confidence = result.get("confidence", 0.0)
-                time_ms = result.get("processing_time_ms", 0)
+                time_ms = result.get(
+                    "processing_time_ms", 0
+                )
 
                 st.markdown(answer)
 
@@ -339,19 +353,21 @@ if question:
                     color = "red"
 
                 st.markdown(
-                    f"**Confidence:** :{color}[{confidence:.0%}]"
-                    f" | ⏱ {time_ms}ms"
+                    f"Confidence: :{color}[{confidence:.0%}]"
+                    f" | Time: {time_ms}ms"
                 )
 
                 if chunks:
-                    with st.expander("📄 View Source Chunks"):
+                    with st.expander("View Source Chunks"):
                         for i, chunk in enumerate(chunks, 1):
                             st.markdown(
-                                f"**Chunk {i} — "
-                                f"Page {chunk['page']}"
-                                f" | Score {chunk['score']:.3f}**"
+                                f"Chunk {i} "
+                                f"Page {chunk['page']} "
+                                f"Score {chunk['score']:.3f}"
                             )
-                            st.text(chunk["text"][:400] + "...")
+                            st.text(
+                                chunk["text"][:400] + "..."
+                            )
                             st.divider()
 
                 st.session_state.messages.append(
