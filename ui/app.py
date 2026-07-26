@@ -7,34 +7,19 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
+# ── must run before anything else ────────────────────────────────
 def load_secrets():
-    """
-    pull all secrets from streamlit cloud secrets manager
-    and push them into os.environ so settings.py can read them
-    """
     try:
-        keys = [
-            "GROQ_API_KEY",
-            "EMBEDDING_MODEL",
-            "LLM_MODEL",
-            "CHROMA_PERSIST_DIR",
-            "CHROMA_COLLECTION_NAME",
-            "TOP_K_RESULTS",
-            "RELEVANCE_THRESHOLD",
-            "CHUNK_SIZE",
-            "CHUNK_OVERLAP",
-            "PDF_URL",
-            "PDF_LOCAL_PATH",
-        ]
-        for key in keys:
-            if key in st.secrets:
-                os.environ[key] = str(st.secrets[key])
+        all_secrets = dict(st.secrets)
+        for key, value in all_secrets.items():
+            os.environ[key] = str(value)
     except Exception:
         pass
 
 
 load_secrets()
 
+# ── now safe to import settings ───────────────────────────────────
 from config.settings import settings
 from graph.rag_graph import run_query
 from ingestion.ingest import run_ingestion
@@ -47,26 +32,49 @@ st.set_page_config(
 )
 
 
+def get_groq_key():
+    """
+    try every possible way to get the groq key
+    """
+    # way 1 - from os environ
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if key and key.startswith("gsk_"):
+        return key
+
+    # way 2 - directly from st.secrets
+    try:
+        key = str(st.secrets["GROQ_API_KEY"]).strip()
+        if key and key.startswith("gsk_"):
+            os.environ["GROQ_API_KEY"] = key
+            return key
+    except Exception:
+        pass
+
+    # way 3 - from st.secrets as dict
+    try:
+        key = str(st.secrets.get("GROQ_API_KEY", "")).strip()
+        if key and key.startswith("gsk_"):
+            os.environ["GROQ_API_KEY"] = key
+            return key
+    except Exception:
+        pass
+
+    return ""
+
+
 def check_groq_key():
-    """
-    verify groq key exists and looks valid
-    """
-    key = settings.groq_api_key
+    key = get_groq_key()
     if not key:
         return False, "GROQ_API_KEY is empty"
     if not key.startswith("gsk_"):
-        return False, f"Key format wrong — starts with: {key[:6]}"
-    return True, f"Key found — starts with: {key[:8]}..."
+        return False, f"Key format wrong starts with {key[:6]}"
+    return True, f"Key found starts with {key[:8]}..."
 
 
 def check_knowledge_base():
-    """
-    check if chromadb has data
-    """
     try:
         import chromadb
         from chromadb.utils import embedding_functions
-
         ef = embedding_functions.DefaultEmbeddingFunction()
         client = chromadb.PersistentClient(
             path=settings.chroma_persist_dir
@@ -82,14 +90,14 @@ def check_knowledge_base():
 
 
 def test_groq_connection():
-    """
-    make a tiny test call to groq to verify connection
-    """
+    key = get_groq_key()
+    if not key:
+        return False, "No API key found"
     try:
         from groq import Groq
-        client = Groq(api_key=settings.groq_api_key)
+        client = Groq(api_key=key)
         resp = client.chat.completions.create(
-            model=settings.llm_model,
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "user", "content": "Say OK"}
             ],
@@ -105,32 +113,24 @@ def test_groq_connection():
 def load_ebook():
     progress = st.progress(0)
     status = st.empty()
-
     try:
         status.text("📥 Downloading PDF...")
         progress.progress(15)
-
         status.text("📄 Extracting text...")
         progress.progress(35)
-
         status.text("✂️ Chunking pages...")
-        progress.progress(50)
-
+        progress.progress(55)
         status.text("🔢 Generating embeddings...")
-        progress.progress(70)
-
+        progress.progress(75)
         status.text("💾 Saving to ChromaDB...")
-        progress.progress(85)
-
+        progress.progress(90)
         run_ingestion(rebuild=False)
-
         progress.progress(100)
         status.text("✅ Done!")
         time.sleep(1)
         progress.empty()
         status.empty()
         return True
-
     except Exception as e:
         progress.empty()
         status.empty()
@@ -139,6 +139,11 @@ def load_ebook():
 
 
 def ask_question(question: str):
+    # make sure key is set before calling pipeline
+    key = get_groq_key()
+    if key:
+        os.environ["GROQ_API_KEY"] = key
+
     try:
         start = time.time()
         result = run_query(question)
@@ -156,29 +161,25 @@ st.caption(
     "with page citations and confidence scores."
 )
 
-
 # ── sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📊 System Status")
 
-    # check groq key
     key_ok, key_msg = check_groq_key()
+    is_populated, chunk_count = check_knowledge_base()
 
     if key_ok:
         st.success(f"✅ Groq key: {key_msg}")
     else:
         st.error(f"❌ Groq key issue: {key_msg}")
         st.warning(
-            "Go to Streamlit Cloud → Settings → Secrets\n"
-            "Add: GROQ_API_KEY = \"gsk_your_key_here\""
+            "Go to Streamlit Cloud\n"
+            "→ Settings → Secrets\n"
+            "Add your GROQ_API_KEY"
         )
-
-    # check knowledge base
-    is_populated, chunk_count = check_knowledge_base()
 
     if not is_populated:
         st.warning("⚠️ Knowledge base is empty")
-
         if st.button(
             "📥 Load Agentic AI eBook",
             use_container_width=True,
@@ -204,17 +205,16 @@ with st.sidebar:
 
     st.divider()
 
-    # test groq connection button
     if st.button(
         "🔌 Test Groq Connection",
         use_container_width=True,
     ):
-        with st.spinner("Testing..."):
+        with st.spinner("Testing Groq..."):
             ok, msg = test_groq_connection()
             if ok:
-                st.success(f"✅ Groq connected: {msg}")
+                st.success(f"✅ Groq works: {msg}")
             else:
-                st.error(f"❌ Groq failed: {msg}")
+                st.error(f"❌ Groq error: {msg}")
 
     if st.button(
         "🔄 Refresh Status",
@@ -281,7 +281,6 @@ for msg in st.session_state.messages:
 
 # ── chat input ────────────────────────────────────────────────────
 prefill = st.session_state.pop("prefill", None)
-
 chat_disabled = not is_populated or not key_ok
 
 user_input = st.chat_input(
@@ -289,7 +288,6 @@ user_input = st.chat_input(
     disabled=chat_disabled,
 )
 question = prefill or user_input
-
 
 if question:
     if not key_ok:
@@ -319,24 +317,17 @@ if question:
 
             if error:
                 st.error(f"Error: {error}")
-                st.info(
-                    "If this says Connection error — "
-                    "check your Groq API key in Secrets."
-                )
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "content": f"Error: {error}",
                     }
                 )
-
             else:
                 answer = result.get("answer", "")
                 chunks = result.get("context_chunks", [])
                 confidence = result.get("confidence", 0.0)
-                time_ms = result.get(
-                    "processing_time_ms", 0
-                )
+                time_ms = result.get("processing_time_ms", 0)
 
                 st.markdown(answer)
 
@@ -360,9 +351,7 @@ if question:
                                 f"Page {chunk['page']}"
                                 f" | Score {chunk['score']:.3f}**"
                             )
-                            st.text(
-                                chunk["text"][:400] + "..."
-                            )
+                            st.text(chunk["text"][:400] + "...")
                             st.divider()
 
                 st.session_state.messages.append(
