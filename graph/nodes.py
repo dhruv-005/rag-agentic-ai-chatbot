@@ -19,19 +19,11 @@ from graph.prompts import (
 
 @st.cache_resource(show_spinner=False)
 def get_embedding_function():
-    """
-    chromadb default embedding uses onnxruntime
-    no torch no torchvision required
-    loads once and stays cached
-    """
     return embedding_functions.DefaultEmbeddingFunction()
 
 
 @st.cache_resource(show_spinner=False)
 def get_chroma_collection():
-    """
-    open chromadb connection once and reuse it
-    """
     ef = get_embedding_function()
     client = chromadb.PersistentClient(
         path=settings.chroma_persist_dir
@@ -45,34 +37,32 @@ def get_chroma_collection():
 
 @st.cache_resource(show_spinner=False)
 def get_groq_client():
-    """
-    create groq client once and reuse across queries
-    """
-    return Groq(api_key=settings.groq_api_key)
+    key = settings.groq_api_key
+    if not key:
+        raise ValueError(
+            "GROQ_API_KEY is not set. "
+            "Add it to Streamlit Secrets."
+        )
+    return Groq(api_key=key)
 
 
 def retrieve_node(state: RAGState) -> RAGState:
-    """
-    embed question using chromadb built in function
-    then search for top k most relevant chunks
-    """
     question = state["question"]
 
     try:
         collection = get_chroma_collection()
-    except Exception:
+        results = collection.query(
+            query_texts=[question],
+            n_results=settings.top_k_results,
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception as e:
+        print(f"Retrieval error: {e}")
         return {
             **state,
             "retrieved_chunks": [],
             "best_score": 0.0,
         }
-
-    # chromadb handles embedding the query internally
-    results = collection.query(
-        query_texts=[question],
-        n_results=settings.top_k_results,
-        include=["documents", "metadatas", "distances"],
-    )
 
     chunks = []
     best_score = 0.0
@@ -109,26 +99,16 @@ def retrieve_node(state: RAGState) -> RAGState:
 
 
 def grade_relevance_node(state: RAGState) -> RAGState:
-    """
-    check best score against threshold
-    set route for conditional edge
-    """
     best_score = state.get("best_score", 0.0)
-
     route = (
         "generate"
         if best_score >= settings.relevance_threshold
         else "no_answer"
     )
-
     return {**state, "route": route}
 
 
 def generate_node(state: RAGState) -> RAGState:
-    """
-    build grounded prompt and call groq llm
-    then self check the answer for hallucinations
-    """
     question = state["question"]
     chunks = state["retrieved_chunks"]
 
@@ -143,48 +123,64 @@ def generate_node(state: RAGState) -> RAGState:
         question=question,
     )
 
-    client = get_groq_client()
+    try:
+        client = get_groq_client()
+    except ValueError as e:
+        return {
+            **state,
+            "answer": str(e),
+            "confidence": 0.0,
+            "self_check_passed": False,
+        }
 
-    answer_resp = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise assistant. "
-                    "Only answer from the provided context. "
-                    "Never guess or make up information."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=800,
-    )
+    try:
+        answer_resp = client.chat.completions.create(
+            model=settings.llm_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise assistant. "
+                        "Only answer from the provided context. "
+                        "Never guess or make up information."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+        answer_text = (
+            answer_resp.choices[0].message.content.strip()
+        )
+    except Exception as e:
+        return {
+            **state,
+            "answer": f"LLM error: {str(e)}",
+            "confidence": 0.0,
+            "self_check_passed": False,
+        }
 
-    answer_text = (
-        answer_resp.choices[0].message.content.strip()
-    )
-
-    check_prompt = SELF_CHECK_PROMPT.format(
-        question=question,
-        context=context_text,
-        answer=answer_text,
-    )
-
-    check_resp = client.chat.completions.create(
-        model=settings.llm_model,
-        messages=[
-            {"role": "user", "content": check_prompt}
-        ],
-        temperature=0.0,
-        max_tokens=5,
-    )
-
-    check_text = (
-        check_resp.choices[0].message.content.strip().lower()
-    )
-    self_check_passed = check_text.startswith("yes")
+    try:
+        check_prompt = SELF_CHECK_PROMPT.format(
+            question=question,
+            context=context_text,
+            answer=answer_text,
+        )
+        check_resp = client.chat.completions.create(
+            model=settings.llm_model,
+            messages=[
+                {"role": "user", "content": check_prompt}
+            ],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        check_text = (
+            check_resp.choices[0].message.content.strip().lower()
+        )
+        self_check_passed = check_text.startswith("yes")
+    except Exception:
+        self_check_passed = True
 
     avg_score = float(
         np.mean([c["score"] for c in chunks])
@@ -203,9 +199,6 @@ def generate_node(state: RAGState) -> RAGState:
 
 
 def no_answer_node(state: RAGState) -> RAGState:
-    """
-    fallback when retrieval finds nothing relevant
-    """
     return {
         **state,
         "answer": NO_ANSWER_RESPONSE,
@@ -215,7 +208,4 @@ def no_answer_node(state: RAGState) -> RAGState:
 
 
 def route_after_grading(state: RAGState) -> str:
-    """
-    conditional edge function for langgraph
-    """
     return state.get("route", "no_answer")
