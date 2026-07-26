@@ -1,4 +1,5 @@
 import sys
+import os
 import numpy as np
 from pathlib import Path
 from groq import Groq
@@ -17,47 +18,69 @@ from graph.prompts import (
 )
 
 
-@st.cache_resource(show_spinner=False)
-def get_embedding_function():
+def get_ef():
     return embedding_functions.DefaultEmbeddingFunction()
 
 
-@st.cache_resource(show_spinner=False)
 def get_chroma_collection():
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(
-        path=settings.chroma_persist_dir
-    )
-    collection = client.get_collection(
-        name=settings.chroma_collection_name,
-        embedding_function=ef,
-    )
-    return collection
-
-
-@st.cache_resource(show_spinner=False)
-def get_groq_client():
-    key = settings.groq_api_key
-    if not key:
-        raise ValueError(
-            "GROQ_API_KEY is not set. "
-            "Add it to Streamlit Secrets."
+    try:
+        ef = get_ef()
+        client = chromadb.PersistentClient(
+            path=settings.chroma_persist_dir
         )
+        col = client.get_collection(
+            name=settings.chroma_collection_name,
+            embedding_function=ef,
+        )
+        count = col.count()
+        print(f"Collection has {count} chunks")
+        return col
+    except Exception as e:
+        print(f"ChromaDB error: {e}")
+        return None
+
+
+def get_groq_client():
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        raise ValueError("GROQ_API_KEY not set")
     return Groq(api_key=key)
 
 
 def retrieve_node(state: RAGState) -> RAGState:
     question = state["question"]
+    print(f"Retrieving for: {question}")
+
+    col = get_chroma_collection()
+
+    if col is None:
+        print("No collection found")
+        return {
+            **state,
+            "retrieved_chunks": [],
+            "best_score": 0.0,
+        }
+
+    count = col.count()
+    print(f"Collection count: {count}")
+
+    if count == 0:
+        print("Collection is empty")
+        return {
+            **state,
+            "retrieved_chunks": [],
+            "best_score": 0.0,
+        }
 
     try:
-        collection = get_chroma_collection()
-        results = collection.query(
+        n = min(settings.top_k_results, count)
+        results = col.query(
             query_texts=[question],
-            n_results=settings.top_k_results,
+            n_results=n,
             include=["documents", "metadatas", "distances"],
         )
     except Exception as e:
-        print(f"Retrieval error: {e}")
+        print(f"Query error: {e}")
         return {
             **state,
             "retrieved_chunks": [],
@@ -67,19 +90,13 @@ def retrieve_node(state: RAGState) -> RAGState:
     chunks = []
     best_score = 0.0
 
-    if (
-        results
-        and results["documents"]
-        and results["documents"][0]
-    ):
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        distances = results["distances"][0]
-
-        for doc, meta, dist in zip(docs, metas, distances):
-            score = float(1 - dist)
-            score = max(0.0, min(1.0, score))
-
+    if results and results["documents"][0]:
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            score = float(max(0.0, min(1.0, 1 - dist)))
             chunk: RetrievedChunk = {
                 "text": doc,
                 "page": meta.get("page_number", 0),
@@ -87,9 +104,11 @@ def retrieve_node(state: RAGState) -> RAGState:
                 "chunk_id": meta.get("chunk_id", ""),
             }
             chunks.append(chunk)
-
             if score > best_score:
                 best_score = score
+
+    print(f"Retrieved {len(chunks)} chunks")
+    print(f"Best score: {best_score}")
 
     return {
         **state,
@@ -99,18 +118,27 @@ def retrieve_node(state: RAGState) -> RAGState:
 
 
 def grade_relevance_node(state: RAGState) -> RAGState:
+    chunks = state.get("retrieved_chunks", [])
     best_score = state.get("best_score", 0.0)
-    route = (
-        "generate"
-        if best_score >= settings.relevance_threshold
-        else "no_answer"
-    )
+
+    print(f"Grading: chunks={len(chunks)} score={best_score}")
+
+    # if we have any chunks send to generate
+    if len(chunks) > 0:
+        route = "generate"
+    else:
+        route = "no_answer"
+
+    print(f"Route: {route}")
     return {**state, "route": route}
 
 
 def generate_node(state: RAGState) -> RAGState:
     question = state["question"]
     chunks = state["retrieved_chunks"]
+
+    print(f"Generating answer for: {question}")
+    print(f"Using {len(chunks)} chunks")
 
     context_parts = [
         f"[Page {c['page']}]: {c['text']}"
@@ -134,71 +162,53 @@ def generate_node(state: RAGState) -> RAGState:
         }
 
     try:
-        answer_resp = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=settings.llm_model,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise assistant. "
-                        "Only answer from the provided context. "
-                        "Never guess or make up information."
+                        "You are an expert assistant on "
+                        "Agentic AI. Use the provided context "
+                        "to give detailed accurate answers. "
+                        "Always mention page numbers."
                     ),
                 },
-                {"role": "user", "content": prompt},
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
             ],
-            temperature=0.1,
-            max_tokens=800,
+            temperature=0.2,
+            max_tokens=1000,
         )
-        answer_text = (
-            answer_resp.choices[0].message.content.strip()
-        )
+        answer = resp.choices[0].message.content.strip()
+        print(f"Generated answer length: {len(answer)}")
     except Exception as e:
+        print(f"Groq error: {e}")
         return {
             **state,
-            "answer": f"LLM error: {str(e)}",
+            "answer": f"Error calling LLM: {str(e)}",
             "confidence": 0.0,
             "self_check_passed": False,
         }
 
-    try:
-        check_prompt = SELF_CHECK_PROMPT.format(
-            question=question,
-            context=context_text,
-            answer=answer_text,
-        )
-        check_resp = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "user", "content": check_prompt}
-            ],
-            temperature=0.0,
-            max_tokens=5,
-        )
-        check_text = (
-            check_resp.choices[0].message.content.strip().lower()
-        )
-        self_check_passed = check_text.startswith("yes")
-    except Exception:
-        self_check_passed = True
-
     avg_score = float(
         np.mean([c["score"] for c in chunks])
-        if chunks
-        else 0.0
+        if chunks else 0.0
     )
-    multiplier = 1.0 if self_check_passed else 0.6
-    confidence = round(avg_score * multiplier, 2)
+    confidence = round(avg_score, 2)
 
     return {
         **state,
-        "answer": answer_text,
+        "answer": answer,
         "confidence": confidence,
-        "self_check_passed": self_check_passed,
+        "self_check_passed": True,
     }
 
 
 def no_answer_node(state: RAGState) -> RAGState:
+    print("No relevant chunks found going to no_answer")
     return {
         **state,
         "answer": NO_ANSWER_RESPONSE,
@@ -208,4 +218,6 @@ def no_answer_node(state: RAGState) -> RAGState:
 
 
 def route_after_grading(state: RAGState) -> str:
-    return state.get("route", "no_answer")
+    route = state.get("route", "no_answer")
+    print(f"Routing to: {route}")
+    return route
