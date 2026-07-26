@@ -41,7 +41,7 @@ def get_groq_key():
     return ""
 
 
-def get_chunk_count():
+def get_count():
     try:
         import chromadb
         from chromadb.utils import embedding_functions
@@ -58,81 +58,50 @@ def get_chunk_count():
         return 0
 
 
-def do_ingest(rebuild=False):
+def force_ingest():
     try:
-        run_ingestion(rebuild=rebuild)
-        return True, ""
+        run_ingestion(rebuild=False)
+        return get_count()
     except Exception as e:
-        return False, str(e)
+        st.error(f"Ingest error: {e}")
+        return 0
 
 
-def ask_question(question):
-    key = get_groq_key()
-    if key:
-        os.environ["GROQ_API_KEY"] = key
-    try:
-        start = time.time()
-        result = run_query(question)
-        result["processing_time_ms"] = int(
-            (time.time() - start) * 1000
-        )
-        return result, None
-    except Exception as e:
-        return None, str(e)
-
-
-# ── page ──────────────────────────────────────────────────────────
 st.title("Agentic AI RAG Chatbot")
 st.caption(
-    "Answers strictly from the Agentic AI eBook "
+    "Answers from the Agentic AI eBook "
     "with page citations and confidence scores."
 )
 
 groq_key = get_groq_key()
-chunk_count = get_chunk_count()
+count = get_count()
 
-# ── auto ingest ───────────────────────────────────────────────────
-if chunk_count == 0:
-    st.info(
-        "Setting up knowledge base for the first time. "
-        "Please wait 3 to 5 minutes..."
-    )
-    bar = st.progress(0)
-    msg = st.empty()
-
-    msg.text("Step 1 of 4 — Downloading PDF...")
-    bar.progress(10)
-
-    ok, err = do_ingest(rebuild=False)
-
-    if ok:
-        bar.progress(100)
-        msg.text("Knowledge base ready!")
-        time.sleep(1)
-        bar.empty()
-        msg.empty()
-        chunk_count = get_chunk_count()
+# always ingest if empty
+if count == 0:
+    with st.spinner(
+        "Setting up knowledge base. Please wait..."
+    ):
+        count = force_ingest()
+    if count > 0:
+        st.success(f"Knowledge base ready with {count} chunks")
         st.rerun()
     else:
-        bar.empty()
-        msg.empty()
-        st.error(f"Auto setup failed: {err}")
-        st.warning(
-            "Click Force Reload eBook in sidebar to retry"
+        st.error(
+            "Knowledge base setup failed. "
+            "Click Force Reload in sidebar."
         )
 
-# ── sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("System Status")
 
     if groq_key:
-        st.success(f"Groq ready: {groq_key[:12]}...")
+        st.success(f"Groq: {groq_key[:10]}...")
     else:
-        st.error("Groq key missing in secrets")
+        st.error("Groq key missing")
 
-    if chunk_count > 0:
-        st.success(f"Knowledge base ready")
-        st.metric("Chunks", chunk_count)
+    if count > 0:
+        st.success("Knowledge base ready")
+        st.metric("Chunks", count)
     else:
         st.error("Knowledge base empty")
 
@@ -142,40 +111,29 @@ with st.sidebar:
         "Force Reload eBook",
         use_container_width=True,
     ):
-        with st.spinner("Reloading eBook..."):
-            ok, err = do_ingest(rebuild=True)
-            if ok:
-                st.success("Done!")
-                st.rerun()
-            else:
-                st.error(f"Failed: {err}")
+        with st.spinner("Reloading..."):
+            run_ingestion(rebuild=True)
+            st.rerun()
 
-    if st.button(
-        "Refresh",
-        use_container_width=True,
-    ):
+    if st.button("Refresh", use_container_width=True):
         st.rerun()
 
     st.divider()
     st.header("Sample Questions")
 
-    samples = [
+    for q in [
         "What is Agentic AI?",
         "How does Agentic AI differ from traditional AI?",
         "What are the core components of an agentic system?",
         "What industries does the eBook mention?",
         "What are the risks of Agentic AI?",
         "What does the eBook say about the future of Agentic AI?",
-    ]
-
-    for q in samples:
+    ]:
         if st.button(q, use_container_width=True):
             st.session_state["prefill"] = q
 
     st.caption("Built with LangGraph, Groq, and ChromaDB")
 
-
-# ── chat ──────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -199,15 +157,14 @@ for msg in st.session_state.messages:
                 with st.expander("View Source Chunks"):
                     for i, ch in enumerate(chunks, 1):
                         st.markdown(
-                            f"Chunk {i} "
-                            f"Page {ch['page']} "
+                            f"Chunk {i} Page {ch['page']} "
                             f"Score {ch['score']:.3f}"
                         )
                         st.text(ch["text"][:400] + "...")
                         st.divider()
 
 prefill = st.session_state.pop("prefill", None)
-disabled = chunk_count == 0 or not groq_key
+disabled = count == 0 or not groq_key
 
 user_input = st.chat_input(
     "Ask a question about Agentic AI...",
@@ -216,10 +173,9 @@ user_input = st.chat_input(
 question = prefill or user_input
 
 if question:
-    if chunk_count == 0:
+    if count == 0:
         st.warning("Knowledge base loading. Please wait.")
         st.stop()
-
     if not groq_key:
         st.error("Groq API key missing.")
         st.stop()
@@ -232,18 +188,14 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Generating answer..."):
-            result, error = ask_question(question)
+            try:
+                start = time.time()
+                result = run_query(question)
+                ms = int((time.time() - start) * 1000)
 
-            if error:
-                st.error(f"Error: {error}")
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error}
-                )
-            else:
                 answer = result.get("answer", "")
                 chunks = result.get("context_chunks", [])
                 confidence = result.get("confidence", 0.0)
-                time_ms = result.get("processing_time_ms", 0)
 
                 st.markdown(answer)
 
@@ -254,28 +206,28 @@ if question:
                 )
                 st.markdown(
                     f"Confidence: :{color}[{confidence:.0%}]"
-                    f" | Time: {time_ms}ms"
+                    f" | Time: {ms}ms"
                 )
 
                 if chunks:
                     with st.expander("View Source Chunks"):
                         for i, ch in enumerate(chunks, 1):
                             st.markdown(
-                                f"Chunk {i} "
-                                f"Page {ch['page']} "
+                                f"Chunk {i} Page {ch['page']} "
                                 f"Score {ch['score']:.3f}"
                             )
                             st.text(ch["text"][:400] + "...")
                             st.divider()
 
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": answer,
-                        "meta": {
-                            "confidence": confidence,
-                            "processing_time_ms": time_ms,
-                            "chunks": chunks,
-                        },
-                    }
-                )
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "meta": {
+                        "confidence": confidence,
+                        "processing_time_ms": ms,
+                        "chunks": chunks,
+                    },
+                })
+
+            except Exception as e:
+                st.error(f"Error: {e}")
