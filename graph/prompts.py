@@ -1,18 +1,10 @@
-# all prompt templates live here so they are easy to tweak
+ANSWER_GENERATION_PROMPT = """You are an expert assistant on
+Agentic AI. Answer the question below using the context provided.
 
+Give a detailed and complete answer. Always reference page numbers
+when available. Use all relevant information from the context.
 
-ANSWER_GENERATION_PROMPT = """You are a helpful assistant that answers
-questions strictly based on the context provided below.
-
-Rules you must follow:
-- Only use information from the context below to answer
-- If the context does not contain the answer say exactly:
-  "I don't have enough information in the knowledge base to answer this."
-- Always mention which page the information came from
-- Keep your answer clear and to the point
-- Do not make up or guess any information not in the context
-
-Context from the Agentic AI eBook:
+Context:
 {context}
 
 Question: {question}
@@ -20,22 +12,17 @@ Question: {question}
 Answer:"""
 
 
-SELF_CHECK_PROMPT = """Look at this question, context, and answer carefully.
+SELF_CHECK_PROMPT = """Is this answer supported by the context?
 
+Context: {context}
 Question: {question}
+Answer: {answer}
 
-Context:
-{context}
-
-Answer given: {answer}
-
-Is every part of the answer fully supported by the context above?
-Reply with only one word: yes or no"""
+Reply yes or no:"""
 
 
 NO_ANSWER_RESPONSE = (
-    "I don't have enough information in the knowledge base to answer "
-    "this question. The retrieved content was not relevant enough to "
-    "give you a reliable answer. Please try rephrasing your question "
-    "or ask something more specific about Agentic AI."
+    "This specific topic was not found in the knowledge base. "
+    "Please ask about Agentic AI definition, components, "
+    "use cases, risks, or future outlook."
 )
