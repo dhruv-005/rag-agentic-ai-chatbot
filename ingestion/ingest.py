@@ -5,15 +5,12 @@ import fitz
 import chromadb
 import numpy as np
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 
-# try new import first then fall back to old one
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ImportError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# make sure we can import from project root
 sys.path.append(str(Path(__file__).parent.parent))
 
 from config.settings import settings
@@ -23,7 +20,7 @@ def download_pdf():
     pdf_path = Path(settings.pdf_local_path)
 
     if pdf_path.exists():
-        print(f"PDF already exists at {pdf_path} — skipping download")
+        print(f"PDF already exists — skipping download")
         return str(pdf_path)
 
     print(f"Downloading PDF from {settings.pdf_url}")
@@ -36,19 +33,18 @@ def download_pdf():
         f.write(response.content)
 
     size_kb = pdf_path.stat().st_size / 1024
-    print(f"Downloaded {size_kb:.1f} KB to {pdf_path}")
+    print(f"Downloaded {size_kb:.1f} KB")
     return str(pdf_path)
 
 
 def extract_text_from_pdf(pdf_path: str):
-    print(f"Extracting text from {pdf_path}")
+    print("Extracting text from PDF")
     doc = fitz.open(pdf_path)
     pages = []
 
     for page_num in range(len(doc)):
         page = doc[page_num]
         raw_text = page.get_text()
-
         lines = [line.strip() for line in raw_text.splitlines()]
         cleaned = "\n".join(line for line in lines if line)
 
@@ -61,12 +57,12 @@ def extract_text_from_pdf(pdf_path: str):
             )
 
     doc.close()
-    print(f"Extracted text from {len(pages)} pages")
+    print(f"Extracted {len(pages)} pages")
     return pages
 
 
 def chunk_pages(pages: list):
-    print("Chunking extracted text")
+    print("Chunking text")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
@@ -95,37 +91,45 @@ def chunk_pages(pages: list):
             )
             chunk_counter += 1
 
-    print(f"Created {len(all_chunks)} chunks total")
+    print(f"Created {len(all_chunks)} chunks")
     return all_chunks
 
 
 def load_embedding_model():
-    print(f"Loading embedding model: {settings.embedding_model}")
-    model = SentenceTransformer(settings.embedding_model)
-    print("Embedding model loaded")
+    """
+    load model with minimal memory footprint
+    """
+    from sentence_transformers import SentenceTransformer
+    print(f"Loading {settings.embedding_model}")
+    model = SentenceTransformer(
+        settings.embedding_model,
+        device="cpu",
+    )
+    print("Model loaded")
     return model
 
 
-def generate_embeddings(chunks: list, model: SentenceTransformer):
-    print(f"Generating embeddings for {len(chunks)} chunks")
+def generate_embeddings(chunks: list, model):
+    print(f"Embedding {len(chunks)} chunks")
     texts = [c["text"] for c in chunks]
 
-    batch_size = 32
+    # smaller batch size uses less RAM
+    batch_size = 16
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        batch_embeddings = model.encode(
+        batch_emb = model.encode(
             batch,
             normalize_embeddings=True,
             show_progress_bar=False,
+            batch_size=16,
         )
-        all_embeddings.extend(batch_embeddings.tolist())
-
+        all_embeddings.extend(batch_emb.tolist())
         done = min(i + batch_size, len(texts))
-        print(f"  Embedded {done}/{len(texts)} chunks")
+        print(f"  {done}/{len(texts)} embedded")
 
-    print("All embeddings generated")
+    print("Embeddings done")
     return all_embeddings
 
 
@@ -134,7 +138,7 @@ def store_in_chromadb(
     embeddings: list,
     rebuild: bool = False,
 ):
-    print("Connecting to ChromaDB")
+    print("Storing in ChromaDB")
 
     persist_path = Path(settings.chroma_persist_dir)
     persist_path.mkdir(parents=True, exist_ok=True)
@@ -146,7 +150,7 @@ def store_in_chromadb(
             client.delete_collection(
                 settings.chroma_collection_name
             )
-            print("Deleted existing collection for rebuild")
+            print("Deleted old collection")
         except Exception:
             pass
 
@@ -154,13 +158,8 @@ def store_in_chromadb(
         collection = client.get_collection(
             settings.chroma_collection_name
         )
-        existing_count = collection.count()
-
-        if existing_count > 0 and not rebuild:
-            print(
-                f"Collection already has {existing_count} chunks. "
-                "Skipping upsert."
-            )
+        if collection.count() > 0 and not rebuild:
+            print(f"Already has {collection.count()} chunks")
             return collection
     except Exception:
         pass
@@ -170,43 +169,35 @@ def store_in_chromadb(
         metadata={"hnsw:space": "cosine"},
     )
 
-    batch_size = 100
+    batch_size = 50
     total = len(chunks)
 
     for i in range(0, total, batch_size):
-        batch_chunks = chunks[i : i + batch_size]
-        batch_embeddings = embeddings[i : i + batch_size]
-
-        ids = [c["chunk_id"] for c in batch_chunks]
-        docs = [c["text"] for c in batch_chunks]
-        metas = [
-            {
-                "page_number": c["page_number"],
-                "source": c["source"],
-                "chunk_id": c["chunk_id"],
-            }
-            for c in batch_chunks
-        ]
+        bc = chunks[i : i + batch_size]
+        be = embeddings[i : i + batch_size]
 
         collection.upsert(
-            ids=ids,
-            embeddings=batch_embeddings,
-            documents=docs,
-            metadatas=metas,
+            ids=[c["chunk_id"] for c in bc],
+            embeddings=be,
+            documents=[c["text"] for c in bc],
+            metadatas=[
+                {
+                    "page_number": c["page_number"],
+                    "source": c["source"],
+                    "chunk_id": c["chunk_id"],
+                }
+                for c in bc
+            ],
         )
-
         done = min(i + batch_size, total)
-        print(f"  Stored {done}/{total} chunks in ChromaDB")
+        print(f"  Stored {done}/{total}")
 
-    final_count = collection.count()
-    print(f"ChromaDB ready with {final_count} chunks")
+    print(f"ChromaDB ready — {collection.count()} chunks")
     return collection
 
 
 def run_ingestion(rebuild: bool = False):
-    print("=" * 50)
-    print("Starting ingestion pipeline")
-    print("=" * 50)
+    print("Starting ingestion")
 
     pdf_path = download_pdf()
     pages = extract_text_from_pdf(pdf_path)
@@ -215,9 +206,10 @@ def run_ingestion(rebuild: bool = False):
     embeddings = generate_embeddings(chunks, model)
     store_in_chromadb(chunks, embeddings, rebuild=rebuild)
 
-    print("=" * 50)
-    print("Ingestion complete!")
-    print("=" * 50)
+    # free model from memory after ingestion
+    del model
+
+    print("Ingestion complete")
 
 
 if __name__ == "__main__":

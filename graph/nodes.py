@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from groq import Groq
 import chromadb
-from sentence_transformers import SentenceTransformer
+import streamlit as st
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -15,55 +15,65 @@ from graph.prompts import (
     NO_ANSWER_RESPONSE,
 )
 
-# load these once when the module is imported
-# so we dont reload them on every single query
-_embedding_model = None
-_chroma_collection = None
-_groq_client = None
 
-
+# ── cached loaders so models load only once ───────────────────────
+@st.cache_resource(show_spinner=False)
 def get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer(settings.embedding_model)
-    return _embedding_model
+    """
+    loads once and stays in memory
+    st.cache_resource persists across reruns
+    so we never reload the model twice
+    """
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer(settings.embedding_model)
+    return model
 
 
+@st.cache_resource(show_spinner=False)
 def get_chroma_collection():
-    global _chroma_collection
-    if _chroma_collection is None:
-        client = chromadb.PersistentClient(
-            path=settings.chroma_persist_dir
-        )
-        _chroma_collection = client.get_collection(
-            settings.chroma_collection_name
-        )
-    return _chroma_collection
+    """
+    opens chromadb connection once and reuses it
+    """
+    client = chromadb.PersistentClient(
+        path=settings.chroma_persist_dir
+    )
+    collection = client.get_collection(
+        settings.chroma_collection_name
+    )
+    return collection
 
 
+@st.cache_resource(show_spinner=False)
 def get_groq_client():
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = Groq(api_key=settings.groq_api_key)
-    return _groq_client
+    """
+    creates groq client once and reuses it
+    """
+    return Groq(api_key=settings.groq_api_key)
 
 
+# ── graph nodes ───────────────────────────────────────────────────
 def retrieve_node(state: RAGState) -> RAGState:
     """
-    embed the user question then search chromadb for the
-    most similar chunks and return them with their scores
+    embed the question and search chromadb
+    for the most relevant chunks
     """
     question = state["question"]
 
-    # embed the question using the same local model used during ingestion
     model = get_embedding_model()
     query_vector = model.encode(
         [question],
         normalize_embeddings=True,
     ).tolist()[0]
 
-    # search chromadb
-    collection = get_chroma_collection()
+    try:
+        collection = get_chroma_collection()
+    except Exception:
+        return {
+            **state,
+            "retrieved_chunks": [],
+            "best_score": 0.0,
+        }
+
     results = collection.query(
         query_embeddings=[query_vector],
         n_results=settings.top_k_results,
@@ -79,20 +89,19 @@ def retrieve_node(state: RAGState) -> RAGState:
         distances = results["distances"][0]
 
         for doc, meta, dist in zip(docs, metas, distances):
-            # chromadb returns cosine distance so convert to similarity
-            similarity_score = float(1 - dist)
-            similarity_score = max(0.0, min(1.0, similarity_score))
+            score = float(1 - dist)
+            score = max(0.0, min(1.0, score))
 
             chunk: RetrievedChunk = {
                 "text": doc,
                 "page": meta.get("page_number", 0),
-                "score": round(similarity_score, 4),
+                "score": round(score, 4),
                 "chunk_id": meta.get("chunk_id", ""),
             }
             chunks.append(chunk)
 
-            if similarity_score > best_score:
-                best_score = similarity_score
+            if score > best_score:
+                best_score = score
 
     return {
         **state,
@@ -103,46 +112,42 @@ def retrieve_node(state: RAGState) -> RAGState:
 
 def grade_relevance_node(state: RAGState) -> RAGState:
     """
-    check if the best score is above the threshold
-    just sets the route field so the conditional edge can use it
+    check if best score clears the threshold
+    set route field for the conditional edge
     """
     best_score = state.get("best_score", 0.0)
 
-    if best_score >= settings.relevance_threshold:
-        route = "generate"
-    else:
-        route = "no_answer"
+    route = (
+        "generate"
+        if best_score >= settings.relevance_threshold
+        else "no_answer"
+    )
 
     return {**state, "route": route}
 
 
 def generate_node(state: RAGState) -> RAGState:
     """
-    build a grounded prompt from the retrieved chunks and
-    call groq llama to generate the final answer
-    then run a self check to verify grounding
+    build grounded prompt from chunks and call groq
+    then run a quick self check for hallucination
     """
     question = state["question"]
     chunks = state["retrieved_chunks"]
 
-    # build the context block with page references
-    context_parts = []
-    for chunk in chunks:
-        context_parts.append(
-            f"[Page {chunk['page']}]: {chunk['text']}"
-        )
+    context_parts = [
+        f"[Page {c['page']}]: {c['text']}"
+        for c in chunks
+    ]
     context_text = "\n\n".join(context_parts)
 
-    # build the final prompt
     prompt = ANSWER_GENERATION_PROMPT.format(
         context=context_text,
         question=question,
     )
 
-    groq_client = get_groq_client()
+    client = get_groq_client()
 
-    # generate the answer
-    answer_response = groq_client.chat.completions.create(
+    answer_resp = client.chat.completions.create(
         model=settings.llm_model,
         messages=[
             {
@@ -158,28 +163,28 @@ def generate_node(state: RAGState) -> RAGState:
         max_tokens=800,
     )
 
-    answer_text = answer_response.choices[0].message.content.strip()
+    answer_text = answer_resp.choices[0].message.content.strip()
 
-    # run self check to see if answer is grounded
-    self_check_prompt = SELF_CHECK_PROMPT.format(
+    check_prompt = SELF_CHECK_PROMPT.format(
         question=question,
         context=context_text,
         answer=answer_text,
     )
 
-    check_response = groq_client.chat.completions.create(
+    check_resp = client.chat.completions.create(
         model=settings.llm_model,
         messages=[
-            {"role": "user", "content": self_check_prompt}
+            {"role": "user", "content": check_prompt}
         ],
         temperature=0.0,
         max_tokens=5,
     )
 
-    check_text = check_response.choices[0].message.content.strip().lower()
+    check_text = (
+        check_resp.choices[0].message.content.strip().lower()
+    )
     self_check_passed = check_text.startswith("yes")
 
-    # calculate confidence score
     avg_score = float(
         np.mean([c["score"] for c in chunks]) if chunks else 0.0
     )
@@ -196,8 +201,7 @@ def generate_node(state: RAGState) -> RAGState:
 
 def no_answer_node(state: RAGState) -> RAGState:
     """
-    fallback when no relevant chunks were found
-    returns a polite message with zero confidence
+    fallback when nothing relevant was retrieved
     """
     return {
         **state,
@@ -209,7 +213,6 @@ def no_answer_node(state: RAGState) -> RAGState:
 
 def route_after_grading(state: RAGState) -> str:
     """
-    this function is used as the conditional edge in langgraph
-    returns the name of the next node to go to
+    used as conditional edge function in langgraph
     """
     return state.get("route", "no_answer")
