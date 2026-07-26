@@ -43,106 +43,34 @@ def get_groq_key():
     return ""
 
 
-def check_groq_key():
-    key = get_groq_key()
-    if not key:
-        return False, "GROQ_API_KEY is empty"
-    if not key.startswith("gsk_"):
-        return False, "Key format is wrong"
-    return True, f"Key found: {key[:10]}..."
-
-
-def check_knowledge_base():
+def get_collection():
+    import chromadb
+    from chromadb.utils import embedding_functions
+    ef = embedding_functions.DefaultEmbeddingFunction()
+    client = chromadb.PersistentClient(
+        path=settings.chroma_persist_dir
+    )
     try:
-        import chromadb
-        from chromadb.utils import embedding_functions
-        ef = embedding_functions.DefaultEmbeddingFunction()
-        client = chromadb.PersistentClient(
-            path=settings.chroma_persist_dir
-        )
         col = client.get_collection(
             name=settings.chroma_collection_name,
             embedding_function=ef,
         )
-        count = col.count()
-        return count > 0, count
+        return col, col.count()
     except Exception:
-        return False, 0
+        return None, 0
 
 
-def auto_ingest_if_empty():
-    """
-    check if database is empty and auto load the ebook
-    this runs silently on every app startup
-    so any device that opens the app gets data automatically
-    """
-    is_populated, count = check_knowledge_base()
-
-    if not is_populated:
-        with st.spinner(
-            "Setting up knowledge base. "
-            "This takes a few minutes on first load..."
-        ):
-            try:
-                run_ingestion(rebuild=False)
-                st.success(
-                    "Knowledge base ready. You can now ask questions."
-                )
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(
-                    f"Failed to load knowledge base: {str(e)}"
-                )
+def check_knowledge_base():
+    col, count = get_collection()
+    return count > 0, count
 
 
-def test_groq_connection():
-    key = get_groq_key()
-    if not key:
-        return False, "No API key found"
+def do_ingest(rebuild=False):
     try:
-        from groq import Groq
-        client = Groq(api_key=key)
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "user", "content": "Say OK"}
-            ],
-            max_tokens=5,
-            temperature=0.0,
-        )
-        reply = resp.choices[0].message.content.strip()
-        return True, reply
+        run_ingestion(rebuild=rebuild)
+        return True, ""
     except Exception as e:
         return False, str(e)
-
-
-def load_ebook_manual():
-    progress = st.progress(0)
-    status = st.empty()
-    try:
-        status.text("Downloading PDF...")
-        progress.progress(15)
-        status.text("Extracting text...")
-        progress.progress(35)
-        status.text("Chunking pages...")
-        progress.progress(55)
-        status.text("Generating embeddings...")
-        progress.progress(75)
-        status.text("Saving to ChromaDB...")
-        progress.progress(90)
-        run_ingestion(rebuild=True)
-        progress.progress(100)
-        status.text("Done!")
-        time.sleep(1)
-        progress.empty()
-        status.empty()
-        return True
-    except Exception as e:
-        progress.empty()
-        status.empty()
-        st.error(f"Ingestion failed: {str(e)}")
-        return False
 
 
 def ask_question(question: str):
@@ -159,11 +87,6 @@ def ask_question(question: str):
         return None, str(e)
 
 
-# ── auto ingest on every startup ──────────────────────────────────
-# this ensures any device that opens the app
-# gets a working knowledge base automatically
-auto_ingest_if_empty()
-
 # ── page ──────────────────────────────────────────────────────────
 st.title("Agentic AI RAG Chatbot")
 st.caption(
@@ -171,66 +94,108 @@ st.caption(
     "Answers include page citations and confidence scores."
 )
 
+key_ok = bool(get_groq_key())
+is_populated, chunk_count = check_knowledge_base()
+
 # ── sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("System Status")
 
-    key_ok, key_msg = check_groq_key()
-    is_populated, chunk_count = check_knowledge_base()
-
-    if key_ok:
-        st.success(f"Groq key ready: {key_msg}")
+    groq_key = get_groq_key()
+    if groq_key:
+        st.success(f"Groq key: {groq_key[:12]}...")
     else:
-        st.error(f"Groq key issue: {key_msg}")
-        st.warning(
-            "Go to Streamlit Cloud\n"
-            "Settings then Secrets\n"
-            "Add your GROQ_API_KEY"
-        )
+        st.error("Groq key missing")
 
-    if not is_populated:
-        st.warning("Knowledge base is empty")
-        if st.button(
-            "Load Agentic AI eBook",
-            use_container_width=True,
-            type="primary",
-            disabled=not key_ok,
-        ):
-            with st.spinner("Loading eBook..."):
-                success = load_ebook_manual()
-                if success:
-                    st.success("eBook loaded successfully")
-                    st.rerun()
+    st.write(f"Chunks in DB: {chunk_count}")
+
+    if chunk_count == 0:
+        st.error("Database is empty")
     else:
-        st.success("Knowledge base ready")
-        st.metric("Chunks stored", chunk_count)
-
-        if st.button(
-            "Reload eBook",
-            use_container_width=True,
-        ):
-            with st.spinner("Reloading..."):
-                load_ebook_manual()
-                st.rerun()
+        st.success(f"Database ready: {chunk_count} chunks")
 
     st.divider()
 
+    # manual ingest button
     if st.button(
-        "Test Groq Connection",
+        "Load eBook Now",
         use_container_width=True,
+        type="primary",
     ):
-        with st.spinner("Testing..."):
-            ok, msg = test_groq_connection()
+        with st.spinner("Running ingestion..."):
+            ok, err = do_ingest(rebuild=False)
             if ok:
-                st.success(f"Groq connected: {msg}")
+                st.success("Done!")
+                st.rerun()
             else:
-                st.error(f"Groq failed: {msg}")
+                st.error(f"Failed: {err}")
 
     if st.button(
-        "Refresh Status",
+        "Force Reload eBook",
         use_container_width=True,
     ):
-        st.rerun()
+        with st.spinner("Rebuilding..."):
+            ok, err = do_ingest(rebuild=True)
+            if ok:
+                st.success("Done!")
+                st.rerun()
+            else:
+                st.error(f"Failed: {err}")
+
+    st.divider()
+
+    # debug section to see what is really happening
+    if st.button(
+        "Show Debug Info",
+        use_container_width=True,
+    ):
+        st.write("ChromaDB path:")
+        st.code(settings.chroma_persist_dir)
+        st.write("Collection name:")
+        st.code(settings.chroma_collection_name)
+        st.write("PDF path:")
+        st.code(settings.pdf_local_path)
+        st.write("PDF URL:")
+        st.code(settings.pdf_url)
+        st.write("Threshold:")
+        st.code(settings.relevance_threshold)
+        st.write("Top K:")
+        st.code(settings.top_k_results)
+
+        pdf_exists = Path(settings.pdf_local_path).exists()
+        st.write(f"PDF file exists: {pdf_exists}")
+
+        db_path = Path(settings.chroma_persist_dir)
+        st.write(f"DB folder exists: {db_path.exists()}")
+
+        if db_path.exists():
+            files = list(db_path.rglob("*"))
+            st.write(f"DB files count: {len(files)}")
+
+    if st.button(
+        "Test Query Direct",
+        use_container_width=True,
+    ):
+        col, count = get_collection()
+        if col and count > 0:
+            try:
+                results = col.query(
+                    query_texts=["What is Agentic AI"],
+                    n_results=3,
+                )
+                docs = results["documents"][0]
+                dists = results["distances"][0]
+                st.write(f"Query returned {len(docs)} chunks")
+                for i, (doc, dist) in enumerate(
+                    zip(docs, dists)
+                ):
+                    score = round(1 - dist, 4)
+                    st.write(f"Chunk {i+1} score: {score}")
+                    st.text(doc[:200])
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+        else:
+            st.error("Collection empty or missing")
 
     st.divider()
     st.header("Sample Questions")
@@ -248,10 +213,43 @@ with st.sidebar:
         if st.button(q, use_container_width=True):
             st.session_state["prefill"] = q
 
-    st.divider()
-    st.caption(
-        "Built with LangGraph, Groq, and ChromaDB"
+    st.caption("Built with LangGraph, Groq, and ChromaDB")
+
+
+# ── auto ingest if empty ──────────────────────────────────────────
+if chunk_count == 0:
+    st.warning(
+        "Knowledge base is empty. Loading eBook automatically..."
     )
+    progress = st.progress(0)
+    status = st.empty()
+
+    try:
+        status.text("Downloading PDF from konverge.ai...")
+        progress.progress(10)
+
+        status.text("Extracting and chunking text...")
+        progress.progress(40)
+
+        status.text("Generating embeddings and storing...")
+        progress.progress(70)
+
+        run_ingestion(rebuild=False)
+
+        progress.progress(100)
+        status.text("Knowledge base ready!")
+        time.sleep(2)
+        progress.empty()
+        status.empty()
+        st.rerun()
+
+    except Exception as e:
+        progress.empty()
+        status.empty()
+        st.error(f"Auto ingestion failed: {str(e)}")
+        st.info(
+            "Click Load eBook Now button in the sidebar"
+        )
 
 
 # ── chat history ──────────────────────────────────────────────────
@@ -294,7 +292,7 @@ for msg in st.session_state.messages:
 
 # ── chat input ────────────────────────────────────────────────────
 prefill = st.session_state.pop("prefill", None)
-chat_disabled = not is_populated or not key_ok
+chat_disabled = chunk_count == 0 or not key_ok
 
 user_input = st.chat_input(
     "Ask a question about Agentic AI...",
@@ -303,17 +301,14 @@ user_input = st.chat_input(
 question = prefill or user_input
 
 if question:
-    if not key_ok:
-        st.error(
-            "Groq API key is missing. "
-            "Add it in Streamlit Cloud Secrets."
+    if chunk_count == 0:
+        st.warning(
+            "Knowledge base is still loading. Please wait."
         )
         st.stop()
 
-    if not is_populated:
-        st.warning(
-            "Knowledge base is loading. Please wait."
-        )
+    if not key_ok:
+        st.error("Groq API key missing.")
         st.stop()
 
     st.session_state.messages.append(
