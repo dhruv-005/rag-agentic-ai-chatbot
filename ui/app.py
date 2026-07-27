@@ -19,8 +19,9 @@ load_secrets()
 
 from config.settings import settings
 from graph.rag_graph import run_query
-from ingestion.ingest import run_ingestion, KNOWLEDGE
+from ingestion.ingest import run_ingestion
 
+KNOWLEDGE_COUNT = 25
 
 st.set_page_config(
     page_title="Agentic AI Chatbot",
@@ -42,10 +43,6 @@ def get_groq_key():
 
 
 def get_collection_status():
-    """
-    return detailed status of chromadb collection
-    so we can diagnose exactly what is happening
-    """
     status = {
         "client_ok": False,
         "collection_exists": False,
@@ -55,35 +52,28 @@ def get_collection_status():
         "path_exists": False,
         "files_in_path": [],
     }
-
     try:
         path = Path(settings.chroma_persist_dir)
         status["path_exists"] = path.exists()
-
         if path.exists():
             status["files_in_path"] = [
                 str(f.name) for f in path.iterdir()
             ]
-
         import chromadb
         from chromadb.utils import embedding_functions
-
         ef = embedding_functions.DefaultEmbeddingFunction()
         client = chromadb.PersistentClient(
             path=settings.chroma_persist_dir
         )
         status["client_ok"] = True
-
         col = client.get_collection(
             name=settings.chroma_collection_name,
             embedding_function=ef,
         )
         status["collection_exists"] = True
         status["chunk_count"] = col.count()
-
     except Exception as e:
         status["error"] = str(e)
-
     return status
 
 
@@ -96,8 +86,7 @@ def do_ingest(rebuild=False):
 
 
 def get_count():
-    s = get_collection_status()
-    return s["chunk_count"]
+    return get_collection_status()["chunk_count"]
 
 
 def ask_question(question):
@@ -126,22 +115,21 @@ groq_key = get_groq_key()
 status = get_collection_status()
 count = status["chunk_count"]
 
-# ── auto ingest if empty ──────────────────────────────────────────
+# auto ingest if empty
 if count == 0:
-    st.warning(
-        "Knowledge base is empty. Setting up now..."
-    )
+    st.info("Setting up knowledge base. Please wait...")
     ok, err = do_ingest(rebuild=False)
     if ok:
         status = get_collection_status()
         count = status["chunk_count"]
         if count > 0:
             st.success(f"Ready with {count} chunks")
+            time.sleep(1)
             st.rerun()
         else:
             st.error(
                 "Ingestion ran but still 0 chunks. "
-                "Check diagnosis tab below."
+                "Check Diagnosis tab."
             )
     else:
         st.error(f"Ingestion failed: {err}")
@@ -195,33 +183,42 @@ with st.sidebar:
     st.caption("Built with LangGraph, Groq, and ChromaDB")
 
 
-# ── diagnosis tab ─────────────────────────────────────────────────
+# ── tabs ──────────────────────────────────────────────────────────
 main_tab, diag_tab = st.tabs(["Chat", "Diagnosis"])
 
+
+# ── diagnosis tab ─────────────────────────────────────────────────
 with diag_tab:
-    st.header("Diagnosis — Find Root Cause")
+    st.header("Diagnosis")
 
     st.subheader("ChromaDB Status")
     st.json(status)
 
-    st.subheader("Environment")
+    st.subheader("Environment Info")
     st.write(f"Groq key present: {bool(groq_key)}")
-    st.write(f"Groq key starts with: {groq_key[:8] if groq_key else 'none'}")
+    st.write(
+        f"Groq key prefix: "
+        f"{groq_key[:8] if groq_key else 'none'}"
+    )
     st.write(f"Chroma path: {settings.chroma_persist_dir}")
-    st.write(f"Collection name: {settings.chroma_collection_name}")
+    st.write(
+        f"Collection: {settings.chroma_collection_name}"
+    )
     st.write(f"Top K: {settings.top_k_results}")
     st.write(f"Threshold: {settings.relevance_threshold}")
-    st.write(f"Knowledge chunks in code: {len(KNOWLEDGE)}")
+    st.write(f"Knowledge items in code: {KNOWLEDGE_COUNT}")
 
     st.subheader("Test Direct ChromaDB Query")
     if st.button("Run Test Query", use_container_width=True):
         if count == 0:
-            st.error("No chunks in database to query")
+            st.error("No chunks in database")
         else:
             try:
                 import chromadb
                 from chromadb.utils import embedding_functions
-                ef = embedding_functions.DefaultEmbeddingFunction()
+                ef = (
+                    embedding_functions.DefaultEmbeddingFunction()
+                )
                 client = chromadb.PersistentClient(
                     path=settings.chroma_persist_dir
                 )
@@ -235,7 +232,9 @@ with diag_tab:
                 )
                 docs = results["documents"][0]
                 dists = results["distances"][0]
-                st.success(f"Query returned {len(docs)} chunks")
+                st.success(
+                    f"Query returned {len(docs)} chunks"
+                )
                 for i, (doc, dist) in enumerate(
                     zip(docs, dists)
                 ):
@@ -259,19 +258,19 @@ with diag_tab:
                     messages=[
                         {
                             "role": "user",
-                            "content": "Say: I am working correctly",
+                            "content": "Say: working correctly",
                         }
                     ],
                     max_tokens=20,
                 )
                 reply = resp.choices[0].message.content
-                st.success(f"Groq response: {reply}")
+                st.success(f"Groq works: {reply}")
             except Exception as e:
                 st.error(f"Groq failed: {e}")
 
-    st.subheader("Manual Ingest")
-    col1, col2 = st.columns(2)
-    with col1:
+    st.subheader("Manual Ingest Controls")
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button(
             "Run Ingest",
             use_container_width=True,
@@ -279,11 +278,11 @@ with diag_tab:
             with st.spinner("Running..."):
                 ok, err = do_ingest(rebuild=False)
                 if ok:
-                    new_count = get_count()
-                    st.success(f"Done. Count: {new_count}")
+                    new = get_count()
+                    st.success(f"Done. Count: {new}")
                 else:
                     st.error(f"Failed: {err}")
-    with col2:
+    with c2:
         if st.button(
             "Force Rebuild",
             use_container_width=True,
@@ -291,8 +290,8 @@ with diag_tab:
             with st.spinner("Rebuilding..."):
                 ok, err = do_ingest(rebuild=True)
                 if ok:
-                    new_count = get_count()
-                    st.success(f"Done. Count: {new_count}")
+                    new = get_count()
+                    st.success(f"Done. Count: {new}")
                 else:
                     st.error(f"Failed: {err}")
 
@@ -305,7 +304,10 @@ with main_tab:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg["role"] == "assistant" and "meta" in msg:
+            if (
+                msg["role"] == "assistant"
+                and "meta" in msg
+            ):
                 meta = msg["meta"]
                 c = meta.get("confidence", 0)
                 t = meta.get("processing_time_ms", 0)
@@ -323,10 +325,13 @@ with main_tab:
                     with st.expander("View Source Chunks"):
                         for i, ch in enumerate(chunks, 1):
                             st.markdown(
-                                f"Chunk {i} Page {ch['page']} "
+                                f"Chunk {i} "
+                                f"Page {ch['page']} "
                                 f"Score {ch['score']:.3f}"
                             )
-                            st.text(ch["text"][:400] + "...")
+                            st.text(
+                                ch["text"][:400] + "..."
+                            )
                             st.divider()
 
     prefill = st.session_state.pop("prefill", None)
@@ -366,8 +371,12 @@ with main_tab:
                     )
                 else:
                     answer = result.get("answer", "")
-                    chunks = result.get("context_chunks", [])
-                    confidence = result.get("confidence", 0.0)
+                    chunks = result.get(
+                        "context_chunks", []
+                    )
+                    confidence = result.get(
+                        "confidence", 0.0
+                    )
                     time_ms = result.get(
                         "processing_time_ms", 0
                     )
@@ -380,15 +389,21 @@ with main_tab:
                         else "red"
                     )
                     st.markdown(
-                        f"Confidence: :{color}[{confidence:.0%}]"
+                        f"Confidence: :{color}"
+                        f"[{confidence:.0%}]"
                         f" | Time: {time_ms}ms"
                     )
 
                     if chunks:
-                        with st.expander("View Source Chunks"):
-                            for i, ch in enumerate(chunks, 1):
+                        with st.expander(
+                            "View Source Chunks"
+                        ):
+                            for i, ch in enumerate(
+                                chunks, 1
+                            ):
                                 st.markdown(
-                                    f"Chunk {i} Page {ch['page']} "
+                                    f"Chunk {i} "
+                                    f"Page {ch['page']} "
                                     f"Score {ch['score']:.3f}"
                                 )
                                 st.text(
